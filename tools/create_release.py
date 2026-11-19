@@ -28,65 +28,72 @@ REPO = "blender-video-to-blockout"
 TAG = "v1.10.3"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-BODY = """## 安装
+BODY = """## Installation
 
-### Blender 插件
+### Blender addon
 
-下载 **blockout_helper.zip** → Blender 里
-`Edit > Preferences > Add-ons > Install` 安装。
+Download **blockout_helper.zip**, then in Blender:
+`Edit > Preferences > Add-ons > Install`.
 
-> **升级前必须先禁用旧版。** Blender 只注销顶层模块，子模块会留在
-> `sys.modules` 里，不禁用的话装的还是旧代码。
+> **Disable the previous version before upgrading.** Blender only unregisters the
+> top-level module; submodules stay in `sys.modules`, so a straight upgrade keeps
+> running the old code.
 
-装好后在偏好设置里二选一：
-- **插件直连** — 填 API Key，改完自动保存，重启不丢
-- **走 DSH** — 复用 DSH 已配好的模型，端口填 `0` 自动探测
+Choose a request mode in the addon preferences:
+- **Direct** — supply your own API key. It is saved automatically and survives
+  restarts.
+- **Via DSH** — reuse the model already configured in DSH. Set the port to `0`
+  for auto-detection.
 
-### DSH 插件（可选，让 Blender 借 DSH 的模型）
+### DSH plugin (optional)
 
-下载 **dsh-blender-chat.zip**，解开后：
+Download **dsh-blender-chat.zip**, extract it, then:
 
 ```powershell
-node install.mjs   # 装进当前 DSH profile
-node doctor.mjs    # 五步诊断
-node probe.mjs     # 端到端自检
+node install.mjs   # install into the current DSH profile
+node doctor.mjs    # five-step diagnostic
+node probe.mjs     # end-to-end self test
 ```
 
 ---
 
-## 功能
+## Features
 
-**Blender 插件**
-- 视频 / COLMAP → 白膜的完整链路（导入、骨骼、运镜、验收、导出）
-- AI 助手面板：三档权限、上下滚动、放大到文本编辑器、随时中断
-- 空回复、工具轮无文本、达到步数上限时都给出可读说明，不再白屏
+**Blender addon**
+- Full video / COLMAP to blockout pipeline: import, rig, camera, verify, export
+- AI assistant panel: three permission levels, scrolling, expand to text editor,
+  interrupt at any time
+- Readable messages when the model returns nothing, when a tool-only turn
+  produces no text, or when the step limit is reached, instead of a blank panel
 
-**DSH 插件**
-- 让 Blender 面板复用 DSH 已配置的模型，不用填 API Key
-- 端口自动探测（DSH 每次启动都换端口，实测见过 53064 → 64944 → 58169 → 63524 → 49648）
+**DSH plugin**
+- Lets the Blender panel reuse the model configured in DSH, no API key needed
+- Automatic port detection, since DSH picks a new port on every start
+  (observed 53064 -> 64944 -> 58169 -> 63524 -> 49648)
 
 ---
 
-## 这一版修掉的问题
+## Problems fixed in this release
 
-| 问题 | 原因 |
+| Symptom | Cause |
 |---|---|
-| 面板画到一半就不见了 | draw() 里某段抛异常，Blender 完全静默，只画到出错那行 |
-| 回答框从来没出现过 | `MESSAGEBOX` 这个 icon 在 Blender 4.5 不存在 |
-| 切换会话后答案消失 | 答案存在一个全局槽位，切走就清空 |
-| API Key 每次重启都没了 | 偏好设置从不落盘 |
-| 空回复时面板一片空白 | 空文本不发 final 事件 |
-| DSH 端口老是选错 | 58000+ 端口会接受 TCP 后立刻 RST，被误判成 HTTP 服务 |
+| Panel stopped rendering halfway | A `draw()` section raised; Blender reports nothing and simply stops at that line |
+| The answer box never appeared | `MESSAGEBOX` does not exist as an icon in Blender 4.5 |
+| Answers vanished after switching sessions | The answer lived in a single global slot that was cleared on switch |
+| API key lost on every restart | Addon preferences were never saved to disk |
+| Blank panel on an empty response | Empty text never emitted a `final` event |
+| Wrong DSH port chosen | Some ports accept TCP then send RST, and were mistaken for HTTP services |
 
 ---
 
-## 测试
+## Tests
 
-30 套回归，全部通过。覆盖插件注册与重装、视频链路、agent 工具循环、
-SSE 流式解析、会话隔离、答案持久化、面板分段渲染、icon 校验、
-权限三档、Key 落盘、DSH 通道、端口探测。
+30 regression suites, all passing. Coverage: addon registration and reinstall,
+video chain, agent tool loop, SSE stream parsing, session isolation, answer
+persistence, panel sectioned drawing, icon validation, three permission levels,
+key persistence, DSH channel, port detection.
 
-需要真实 API Key 的两套在无 Key 时自行跳过。
+The two suites that need a real API key skip themselves when none is configured.
 """
 
 ASSETS = [
@@ -181,7 +188,7 @@ def main():
     else:
         payload = {
             "tag_name": TAG,
-            "name": "v1.10.3 — Blender 白膜插件 + DSH 桥接插件",
+            "name": "v1.10.3 — Blender blockout addon + DSH bridge plugin",
             "body": BODY,
             "draft": False,
             "prerelease": False,
