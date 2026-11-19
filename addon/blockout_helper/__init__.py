@@ -11,7 +11,8 @@ Layers:
 
 bl_info = {
     "name": "Blockout Helper",
-    "author": "dafeiyu",
+    "author": "MrBear9",
+    "maintainer": "MrBear9",
     "version": (1, 10, 3),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Blockout",
@@ -19,6 +20,8 @@ bl_info = {
                    "box modeling, joint->rig->camera pipeline; LLM chat "
                    "(DeepSeek / OpenAI / Ollama)",
     "category": "3D View",
+    "doc_url": "https://github.com/MrBear9/blender-video-to-blockout",
+    "tracker_url": "https://github.com/MrBear9/blender-video-to-blockout/issues",
 }
 
 import bpy
