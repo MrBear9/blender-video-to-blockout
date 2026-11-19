@@ -1,0 +1,59 @@
+# ══════════════════════════════════════════════════════════════
+# 换行符规范化
+# ══════════════════════════════════════════════════════════════
+# 默认让 git 自动判断文本文件，仓库统一存 LF。
+# 不设的话，Windows 上每次提交都会把整个文件标记为改动
+# （LF→CRLF），diff 全是噪音。
+* text=auto eol=lf
+
+# 明确按文本处理并统一 LF
+*.py      text eol=lf
+*.js      text eol=lf
+*.mjs     text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.toml    text eol=lf
+*.cfg     text eol=lf
+*.ini     text eol=lf
+*.txt     text eol=lf
+.gitignore       text eol=lf
+.gitattributes   text eol=lf
+
+# Windows 专用脚本保留 CRLF
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+# ══════════════════════════════════════════════════════════════
+# 二进制：禁止任何转换
+# ══════════════════════════════════════════════════════════════
+*.blend   binary
+*.blend1  binary
+*.zip     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.mp4     binary
+*.mov     binary
+*.glb     binary
+*.gltf    binary
+*.fbx     binary
+*.obj     binary
+*.exr     binary
+*.hdr     binary
+*.tif     binary
+*.tiff    binary
+*.so      binary
+*.dll     binary
+*.exe     binary
+*.pyc     binary
+
+# ══════════════════════════════════════════════════════════════
+# 语言统计
+# ══════════════════════════════════════════════════════════════
+# GitHub 语言栏不该把 markdown 算成主体
+docs/**   linguist-documentation
+*.md      linguist-documentation

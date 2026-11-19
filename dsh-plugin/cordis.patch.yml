@@ -1,0 +1,13 @@
+# dsh-blender-chat bundle patch
+#
+# Mount the host plugin under its package name, resolved through the
+# profile's node_modules.
+#
+# IMPORTANT: the shape must be `- insert:` with a nested list. A flat
+# `- id: ...` list is NOT a valid bundle patch and the plugin will simply
+# never be loaded (symptom: routes return 404 even though the package is
+# present in node_modules).
+
+- insert:
+    - id: dsh-blender-chat
+      name: dsh-blender-chat
