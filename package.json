@@ -1,0 +1,28 @@
+{
+  "name": "blender-video-to-blockout",
+  "version": "1.10.3",
+  "description": "Video-to-blockout toolchain for Blender, with an AI assistant panel and a DSH bridge plugin.",
+  "license": "MIT",
+  "author": "MrBear9",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrBear9/blender-video-to-blockout.git"
+  },
+  "homepage": "https://github.com/MrBear9/blender-video-to-blockout#readme",
+  "bugs": {
+    "url": "https://github.com/MrBear9/blender-video-to-blockout/issues"
+  },
+  "keywords": [
+    "blender",
+    "blender-addon",
+    "blockout",
+    "colmap",
+    "computer-vision",
+    "deepseek-harness",
+    "dsh-plugin"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}
