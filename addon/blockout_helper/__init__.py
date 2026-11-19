@@ -11,7 +11,7 @@ Layers:
 
 bl_info = {
     "name": "Blockout Helper",
-    "author": "MrBear9",
+    "author": "MrBear9, dafeiyu",
     "maintainer": "MrBear9",
     "version": (1, 10, 3),
     "blender": (4, 2, 0),
