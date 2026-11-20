@@ -13,7 +13,7 @@ bl_info = {
     "name": "Blockout Helper",
     "author": "MrBear9, dafeiyu",
     "maintainer": "MrBear9",
-    "version": (1, 10, 3),
+    "version": (1, 12, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Blockout",
     "description": "Video to blockout + AI assistant: camera alignment, "

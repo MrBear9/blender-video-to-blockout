@@ -198,13 +198,33 @@ def _confirm(session, name, args):
     return box["ok"]
 
 
-def run_turn_via_dsh(session, port, text):
+def _blend_dir():
+    """当前 .blend 所在目录；没保存过就返回空串（让 DSH 用它自己的默认）。
+
+    ⚠ 必须在**主线程**调用（bpy.data.filepath 不是线程安全的），
+    所以调用方要提前取好，别在后台线程里现算。
+    """
+    try:
+        p = bpy.data.filepath or ""
+        if not p:
+            return ""
+        d = os.path.dirname(p)
+        return d if os.path.isdir(d) else ""
+    except Exception:                       # noqa: BLE001
+        return ""
+
+
+def run_turn_via_dsh(session, port, text, attach="", workdir=""):
     """走 DSH 通道跑一轮。**在后台线程里调用。**
 
     和 run_turn 的区别：
       * 不碰 provider / api_key —— 凭据在 DSH 那边
       * 工具调用由 DSH 自己按它那套（228 个 op）决定，这边只是传话
       * 仍然把所有事件 emit 给面板，界面体验一致
+
+    attach：要接上的已有 DSH 会话 id（完整或唯一前缀）。空串 = 新建。
+    workdir：.blend 所在目录，交给 DSH 当工作目录。**由主线程算好传进来**
+             —— 后台线程不能碰 bpy.data。
     """
     from . import dsh_client
 
@@ -229,14 +249,25 @@ def run_turn_via_dsh(session, port, text):
         def _on_progress(m):
             session.emit("think", str(m)[:80])
 
+        # ★ 必须把 Blender 当前工程的目录告诉 DSH。
+        #
+        #   传空串时 DSH 会退到默认工作目录（profiles/desktop），
+        #   那边既看不到 .blend、也看不到这个插件的源码 ——
+        #   结果 AI 只能瞎猜"Blender 没开、9876 端口没人接"
+        #   （那是另一套 dsh-blender-plugin 的说法）。
+        #   给了 cwd，AI 才知道你在哪个项目里、这插件怎么接。
+        #
+        # ⚠ 这里跑在后台线程，不能碰 bpy.data；cwd 由调用方
+        #   （主线程的 operator）算好传进来。
         res = dsh_client.run_turn(
             port, session.sid, text,
-            cwd="",
+            cwd=workdir or "",
             on_delta=_on_delta,
             on_final=_on_final,
             on_progress=_on_progress,
             cancel=tok,
             max_wait=300,
+            attach=attach,
         )
 
         final_text = (res.get("text") or "").strip()
@@ -247,15 +278,19 @@ def run_turn_via_dsh(session, port, text):
 
         err = res.get("error") or "DSH 没有返回内容"
         session.last_error = err
+        debuglog.write("DSH 通道失败: %s | port=%s sid=%s" % (err, port, session.sid))
         session.emit("error", err)
-        session.emit("final", "【DSH 通道失败】%s" % err[:600])
+        # ⚠ 不要在这里 emit("final", ...) 塞一段"【DSH 通道失败】"文本 ——
+        #   那会被当成**助手回复**存进 session.messages，下次打开面板
+        #   看到的第一条就是它，用户以为 AI 在说这句话。
+        #   失败只走 error 事件，版面清空交给 UI。
         return {"ok": False, "text": "", "error": err, "steps": 1}
 
     except Exception as e:                      # noqa: BLE001
         import traceback
         session.last_error = "%s: %s" % (type(e).__name__, e)
         debuglog.write("DSH 通道异常:\n" + traceback.format_exc()[-1200:])
-        session.emit("final", "【DSH 通道异常】%s" % session.last_error[:600])
+        session.emit("error", session.last_error)
         return {"ok": False, "text": "", "error": session.last_error}
     finally:
         session.running = False

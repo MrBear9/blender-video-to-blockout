@@ -311,7 +311,20 @@ def resolve_port(configured=0):
 
 
 def _request(port, path, payload=None, method="GET", timeout=TIMEOUT):
-    url = _base(port) + path
+    # ★ 端口无效（0 / 空 / 负数）时自动探测。
+    #   以前 DEFAULT_PORT = 0，_base() 拼出 http://127.0.0.1:0，
+    #   Windows 上直接抛 WinError 10049（地址无效），
+    #   面板上就显示成"拉取失败"，看不出是端口没解析。
+    try:
+        p = int(port or 0)
+    except (TypeError, ValueError):
+        p = 0
+    if p <= 0 or p > 65535:
+        p = resolve_port(0)
+        if not p:
+            raise DshError("没找到在跑的 DSH。确认 DSH 已启动，"
+                           "或在上方手动填写端口号。")
+    url = _base(p) + path
     data = None
     headers = {"accept": "application/json"}
     if payload is not None:
@@ -338,11 +351,17 @@ def _request(port, path, payload=None, method="GET", timeout=TIMEOUT):
             raise DshError(
                 "DSH 上没有 /blender-chat 路由（HTTP 404）。"
                 "先装 dsh-blender-chat 插件并重启 DSH。")
+        if e.code in (502, 503, 504):
+            # 网关层错误：DSH 上游模型服务暂时不可用（常出现在
+            # 代理/nginx 前面），通常等几秒重发就好，不是插件的问题。
+            raise DshError(
+                "网关暂时不可用（HTTP %d）—— 上游模型服务没响应。"
+                "这通常是临时的，等几秒点「重发上一条」即可。" % e.code)
         raise DshError("DSH 返回 HTTP %d：%s" % (e.code, body or e.reason))
     except urllib.error.URLError as e:
         raise DshError(
             "连不上 DSH（%s）：%s。确认 DSH 在运行，端口填对了没。"
-            % (_base(port), e.reason))
+            % (_base(p), e.reason))
     except json.JSONDecodeError:
         raise DshError("DSH 返回的不是 JSON，端口可能填错了。")
 
@@ -352,15 +371,39 @@ def status(port):
     return _request(port, "/blender-chat/status")
 
 
-def send(port, sid, text, cwd=""):
-    """把一句话交给 DSH。返回 sessionId。"""
+def send(port, sid, text, cwd="", attach=""):
+    """把一句话交给 DSH。返回 sessionId。
+
+    attach: 要接上的已有会话 id（或其唯一前缀）。留空则用/新建
+            blender-chat-xxx 会话。绑上之后该 sid 一直复用那条会话。
+    """
     if not (text or "").strip():
         raise DshError("消息为空")
-    r = _request(port, "/blender-chat/send",
-                 {"sid": sid, "text": text, "cwd": cwd}, method="POST")
+    body = {"sid": sid, "text": text, "cwd": cwd}
+    if attach:
+        body["attach"] = attach
+    r = _request(port, "/blender-chat/send", body, method="POST")
     if not r.get("ok"):
         raise DshError(r.get("error") or "DSH 拒绝了这条消息")
     return r.get("sessionId") or ""
+
+
+def list_sessions(port, limit=100, live_only=True):
+    """列出 DSH 上已有的会话，供面板下拉选择。
+
+    live_only=True 时只返回「工作区里登记着」的会话 —— 归档的、
+    孤儿残留、测试壳子都不会出现，列表跟网页左侧对得上。
+
+    返回 (sessions, can_list)。sessions 是
+    [{sessionId, title, cwd, createdAt}, ...]，按时间倒序。
+    can_list 为 False 时说明列不出来，只能手填完整 id。
+    """
+    params = {"limit": int(limit)}
+    if live_only:
+        params["liveOnly"] = "1"
+    q = urllib.parse.urlencode(params)
+    r = _request(port, "/blender-chat/sessions?" + q)
+    return (r.get("sessions") or []), bool(r.get("canList"))
 
 
 def poll(port, sid, since=0):
@@ -383,12 +426,13 @@ def reset(port, sid):
 
 
 def run_turn(port, sid, text, cwd="", on_delta=None, on_final=None,
-             on_progress=None, cancel=None, max_wait=300):
+             on_progress=None, cancel=None, max_wait=300, attach=""):
     """完整跑一轮：发送 → 轮询 → 回调。**在后台线程里调用。**
 
-    返回 {"ok": bool, "text": str, "error": str, "port": int}
+    返回 {"ok": bool, "text": str, "error": str, "port": int, "sessionId": str}
 
     port=0 时自动探测（DSH 每次启动都换端口，别指望填对）。
+    attach: 接上已有会话（完整 id 或唯一前缀），留空则新建。
     cancel: 任何带 .is_set() 的对象；置位后尽快返回。
     """
     t0 = time.time()
@@ -403,8 +447,9 @@ def run_turn(port, sid, text, cwd="", on_delta=None, on_final=None,
         return {"ok": False, "text": "", "port": 0,
                 "error": "没找到在跑的 DSH。确认 DSH 已启动。"}
 
+    session_id = ""
     try:
-        send(real, sid, text, cwd=cwd)
+        session_id = send(real, sid, text, cwd=cwd, attach=attach)
     except DshError as e:
         return {"ok": False, "text": "", "error": str(e), "port": real}
 
@@ -450,13 +495,15 @@ def run_turn(port, sid, text, cwd="", on_delta=None, on_final=None,
                         pass
 
         if final:
-            return {"ok": True, "text": final, "error": "", "port": real}
+            return {"ok": True, "text": final, "error": "", "port": real,
+                    "sessionId": session_id}
 
         if not running and not events:
             idle_polls += 1
             # 连续几次都空闲且没有任何事件 → 认为这一轮没产出
             if idle_polls >= 8:
                 return {"ok": False, "text": "", "port": real,
+                        "sessionId": session_id,
                         "error": "DSH 没有返回内容（agent 已空闲）"}
         else:
             idle_polls = 0
@@ -464,6 +511,7 @@ def run_turn(port, sid, text, cwd="", on_delta=None, on_final=None,
         time.sleep(0.35)
 
     return {"ok": bool(final), "text": final, "port": real,
+            "sessionId": session_id,
             "error": "" if final else "等待 DSH 超时（%d 秒）" % max_wait}
 
 

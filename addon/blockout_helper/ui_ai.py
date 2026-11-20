@@ -235,6 +235,15 @@ class AISessionItem(bpy.types.PropertyGroup):
     title: bpy.props.StringProperty(default="")
     created: bpy.props.StringProperty(default="")
     count: bpy.props.IntProperty(default=0)
+    # ★ 绑定到哪条 DSH 会话。空 = 由插件新建 blender-chat-xxx；
+    #   填了 = 直接接上那条已有会话（历史接着写）。
+    dsh_session_id: bpy.props.StringProperty(default="")
+
+
+class AIDshPickItem(bpy.types.PropertyGroup):
+    """下拉框里的一条候选：DSH 上已有的会话。"""
+    session_id: bpy.props.StringProperty(default="")
+    label: bpy.props.StringProperty(default="")
 
 
 class AIAnswerItem(bpy.types.PropertyGroup):
@@ -271,9 +280,23 @@ class BlockoutAIState(bpy.types.PropertyGroup):
     heartbeat: bpy.props.IntProperty(default=0)
     tick_time: bpy.props.StringProperty(default="")
 
+    # ── 接上已有 DSH 会话（面板里的选择器用） ──
+    # dsh_pick_index: 下拉框里选中的项；0 = 不接，新建一个
+    dsh_pick_index: bpy.props.IntProperty(default=0)
+    # dsh_picks: 从 /blender-chat/sessions 拉回来的候选列表
+    dsh_picks: bpy.props.CollectionProperty(type=AIDshPickItem)
+    # dsh_pick_status: 上次拉取的结果说明（给面板显示）
+    dsh_pick_status: bpy.props.StringProperty(default="")
+    # dsh_live_only: True = 只列工作区里正在用的会话（默认）
+    dsh_live_only: bpy.props.BoolProperty(default=True)
+    # last_user_text: 最近一次成功发出去的原文，供「重发」用
+    last_user_text: bpy.props.StringProperty(default="")
+
     # ★ 对话记录的滚动与放大
+    #   默认只显示 6 条：Blender 面板只当"最近在聊什么"的窗口，
+    #   完整历史去 DSH 网页端看。N 面板本来就窄，塞多了全是噪音。
     scroll_top: bpy.props.IntProperty(default=0)
-    view_lines: bpy.props.IntProperty(default=12, min=3, max=60)
+    view_lines: bpy.props.IntProperty(default=6, min=3, max=60)
     expanded: bpy.props.BoolProperty(default=False)
     show_debug: bpy.props.BoolProperty(default=False)
     #: 流式接收中的原文（增量累积）。中断时用它保住已生成的部分。
@@ -363,7 +386,12 @@ def _apply_event(st, level, text, sid=None):
     try:
         # 事件自带的 sid 优先（它一定是对的），没有才退回 active_sid
         owner = sid or st.active_sid
-        is_current = (not owner) or (not st.active_sid) or (owner == st.active_sid)
+        # ★ 严格比对：只有 owner 就是当前会话才算"当前"。
+        #   旧逻辑写成 `(not st.active_sid)` 也判真，导致 active_sid 为空时
+        #   **任何**会话的 final 都往面板上写 —— 表现就是"收到的回复
+        #   是上一条消息的回复"（上一条的 final 迟到，正好赶上这条已发送
+        #   但还没回复的空窗）。
+        is_current = (not owner) or (owner == st.active_sid)
 
         if level == "live_reset":
             if is_current:
@@ -401,13 +429,15 @@ def _apply_event(st, level, text, sid=None):
             return
 
         if level == "error":
-            if owner:
-                _ans_set(owner, text)
-                _remember_answer_sid(owner)
             if is_current:
                 st.last_error = text[:1000]
-                st.last_answer = text[:16000]
-                st.last_answer_sid = owner
+                st.status = "出错"
+                # ★ 不写进 last_answer。
+                #   错误是"这轮没成功"，不是"助手的回答"。
+                #   写进去会让面板把报错当正文显示，用户以为 AI 说了这句话。
+                #   清空掉，免得继续挂着上一轮的旧答案冒充本轮结果。
+                st.last_answer = ""
+                st.last_answer_sid = ""
                 _append_line(st, "error", text)
             return
 
@@ -501,6 +531,8 @@ def _poll_body_inner(redraw=True):
     if session is not None:
         st.busy = bool(session.running)
         saved = _answer_of(session.sid)
+        # 只在**本会话**这一轮已结束、且答案与面板不同时才刷新，
+        # 避免重绘时反复覆盖用户正在看的内容。
         if not session.running and saved and st.last_answer != saved:
             st.last_answer = saved[:16000]
             st.last_answer_sid = session.sid
@@ -677,6 +709,11 @@ def _sync_session_list():
     if st is None:
         return
     try:
+        # ★ 重建前先把 dsh_session_id 存下来。
+        #   clear() 会连同绑定一起清掉，重建后必须回填 ——
+        #   否则用户绑好的 DSH 会话一刷新列表就没了。
+        bound = {st.sessions[i].sid: st.sessions[i].dsh_session_id
+                 for i in range(len(st.sessions))}
         st.sessions.clear()
         for sid, s in sorted(_SESSIONS.items(), key=lambda kv: kv[1].created):
             item = st.sessions.add()
@@ -684,8 +721,37 @@ def _sync_session_list():
             item.title = s.title
             item.created = s.created
             item.count = s.message_count()
+            item.dsh_session_id = bound.get(sid, "")
     except Exception as e:                       # noqa: BLE001
         debuglog.write("_sync_session_list 失败: %s" % e)
+
+
+def _title_of_pick(st, session_id):
+    """在已拉取的候选里查这条会话的标题（没拉到就返回空）。"""
+    if not session_id:
+        return ""
+    try:
+        for i in range(len(st.dsh_picks)):
+            it = st.dsh_picks[i]
+            if it.session_id == session_id:
+                return it.label or ""
+    except Exception:                       # noqa: BLE001
+        pass
+    return ""
+
+
+def _attach_of(sid):
+    """查某个 Blender 会话绑定的 DSH sessionId（没有就返回空串）。"""
+    st = getattr(bpy.context.window_manager, "blockout_ai", None)
+    if st is None or not sid:
+        return ""
+    try:
+        for i in range(len(st.sessions)):
+            if st.sessions[i].sid == sid:
+                return st.sessions[i].dsh_session_id or ""
+    except Exception:                       # noqa: BLE001
+        pass
+    return ""
 
 
 def _auto_switch_on_select(st):
@@ -824,6 +890,16 @@ def _session_last_answer(s):
     return ""
 
 
+def _latest_answer(s):
+    """本轮最新的完整回答。
+
+    就是"最后一条有文本的 assistant 消息"，跟 _session_last_answer 同义。
+    单独起个名字是为了让「刷新回答」按钮的调用点读起来明确：
+    它要的是**一条**答案，而供应链上别处要的是"历史里最近那条"。
+    """
+    return _session_last_answer(s)
+
+
 def _select_in_list(sid):
     """把列表的 session_index 挪到 sid 上，让高亮跟 active_sid 一致。"""
     st = getattr(bpy.context.window_manager, "blockout_ai", None)
@@ -888,6 +964,171 @@ class BO_OT_ai_new_session(bpy.types.Operator):
         _sync_session_list()
         _switch_to(s.sid)
         self.report({"INFO"}, "已新建 %s" % s.title)
+        return {"FINISHED"}
+
+
+class BO_OT_ai_pick_dsh(bpy.types.Operator):
+    """从 DSH 拉取已有会话列表，填进下拉框"""
+    bl_idname = "blockout.ai_pick_dsh"
+    bl_label = "刷新 DSH 会话"
+
+    def execute(self, context):
+        from . import dsh_client
+
+        st = context.window_manager.blockout_ai
+        try:
+            p = context.preferences.addons[__package__.split(".")[0]].preferences
+            port = int(p.dsh_port)
+        except Exception:                       # noqa: BLE001
+            port = 0
+
+        try:
+            sessions, can_list = dsh_client.list_sessions(
+                port, live_only=bool(st.dsh_live_only))
+        except Exception as e:                  # noqa: BLE001
+            st.dsh_pick_status = "拉取失败：%s" % str(e)[:100]
+            self.report({"ERROR"}, "拉取 DSH 会话失败")
+            return {"CANCELLED"}
+
+        st.dsh_picks.clear()
+        first = st.dsh_picks.add()
+        first.session_id = ""
+        first.label = "（不接，新建一个）"
+
+        for s in sessions:
+            it = st.dsh_picks.add()
+            it.session_id = s.get("sessionId") or ""
+            title = (s.get("title") or "").strip()
+            cwd = s.get("cwd") or ""
+            # 标签优先显示**标题**（用户认得出），没有标题才退回 id。
+            # 目录尾段放在后面，方便区分同名标题在不同工作区。
+            tail = cwd.replace("\\", "/").rstrip("/").split("/")[-1] if cwd else ""
+            if title:
+                it.label = title[:40] + ("  · " + tail if tail else "")
+            else:
+                it.label = it.session_id[:34] + ("  · " + tail if tail else "")
+
+        st.dsh_pick_index = 0
+        if can_list:
+            scope = "工作区在用" if st.dsh_live_only else "全部"
+            st.dsh_pick_status = "拉到 %d 条（%s）" % (len(sessions), scope)
+        else:
+            st.dsh_pick_status = "DSH 列不出会话，只能手动填 id"
+        self.report({"INFO"}, st.dsh_pick_status)
+        return {"FINISHED"}
+
+
+class BO_OT_ai_pick_menu(bpy.types.Operator):
+    """弹出会话列表（带标题），点一条就绑定"""
+    bl_idname = "blockout.ai_pick_menu"
+    bl_label = "选择 DSH 会话"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        st = context.window_manager.blockout_ai
+        if len(st.dsh_picks) == 0:
+            # 还没拉过就顺手拉一次，省得用户先点刷新
+            try:
+                bpy.ops.blockout.ai_pick_dsh()
+            except Exception:                   # noqa: BLE001
+                pass
+        if len(st.dsh_picks) == 0:
+            self.report({"WARNING"}, "列表是空的，先点刷新按钮")
+            return {"CANCELLED"}
+        context.window_manager.popup_menu(
+            _pick_menu, title="选一条 DSH 会话", icon="LINKED")
+        return {"FINISHED"}
+
+    def execute(self, context):
+        return self.invoke(context, None)
+
+
+def _pick_menu(self, context):
+    """菜单内容：每条会话一行，显示标题 + 工作区 + 相对时间。"""
+    st = context.window_manager.blockout_ai
+    n = len(st.dsh_picks)
+    if n == 0:
+        self.layout.label(text="（空，先点刷新）", icon="INFO")
+        return
+
+    for i in range(n):
+        it = st.dsh_picks[i]
+        if not it.session_id:
+            op = self.layout.operator("blockout.ai_attach_dsh",
+                                      text="（不接，新建一个）", icon="FILE_NEW")
+            op.session_id = ""
+            continue
+        op = self.layout.operator("blockout.ai_attach_dsh", text=it.label or it.session_id)
+        op.session_id = it.session_id
+
+
+class BO_OT_ai_attach_dsh(bpy.types.Operator):
+    """把当前 Blender 会话绑定到选中的 DSH 会话"""
+    bl_idname = "blockout.ai_attach_dsh"
+    bl_label = "绑定到此会话"
+    bl_options = {"REGISTER"}
+
+    #: 菜单里点哪条就传哪条的 sessionId；空串 = 不接（新建）
+    session_id: bpy.props.StringProperty(default="")
+
+    def execute(self, context):
+        st = context.window_manager.blockout_ai
+
+        # 菜单会显式传 session_id；从旧的下拉框走时退回 dsh_pick_index
+        target = (self.session_id or "").strip()
+        if not target:
+            idx = st.dsh_pick_index
+            if 0 <= idx < len(st.dsh_picks):
+                target = st.dsh_picks[idx].session_id or ""
+
+        # ★ 没有活动会话就**自动建一个**再绑。
+        #   以前这里直接报「没有活动会话，先点新建」，但用户的意图
+        #   明明就是"选了这条会话当然是要用它"，多一步点新建纯属刁难。
+        s = _SESSIONS.get(st.active_sid)
+        if s is None:
+            s = _new_session()
+            st.active_sid = s.sid
+            _sync_session_list()
+
+        # 写到 Blender 属性上，面板与重载都还在
+        done = False
+        for i in range(len(st.sessions)):
+            if st.sessions[i].sid == s.sid:
+                st.sessions[i].dsh_session_id = target
+                done = True
+                break
+        if not done:
+            # 列表里没这条（刚建的可能还没同步进来）—— 先同步再写
+            _sync_session_list()
+            for i in range(len(st.sessions)):
+                if st.sessions[i].sid == s.sid:
+                    st.sessions[i].dsh_session_id = target
+                    break
+
+        if target:
+            label = _title_of_pick(st, target) or target[:28]
+            self.report({"INFO"}, "已绑定：%s（发消息时自动接入）" % label)
+        else:
+            self.report({"INFO"}, "已设为每次新建会话")
+        return {"FINISHED"}
+
+
+class BO_OT_ai_unattach_dsh(bpy.types.Operator):
+    """解除绑定：下次发送新建一个 blender-chat 会话"""
+    bl_idname = "blockout.ai_unattach_dsh"
+    bl_label = "解除绑定"
+
+    def execute(self, context):
+        st = context.window_manager.blockout_ai
+        sid = st.active_sid
+        if not sid:
+            return {"CANCELLED"}
+        for i in range(len(st.sessions)):
+            if st.sessions[i].sid == sid:
+                st.sessions[i].dsh_session_id = ""
+                break
+        st.dsh_pick_index = 0
+        self.report({"INFO"}, "已解除绑定")
         return {"FINISHED"}
 
 
@@ -1055,6 +1296,32 @@ class BO_UL_ai_sessions(bpy.types.UIList):
 # 发送 / 取消 / 确认
 # ═══════════════════════════════════════════════════════════════════
 
+class BO_OT_ai_resend(bpy.types.Operator):
+    """把上一条消息原样再发一次（502/超时后重试用）"""
+    bl_idname = "blockout.ai_resend"
+    bl_label = "重发上一条"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        st = context.window_manager.blockout_ai
+        text = (st.last_user_text or "").strip()
+        if not text:
+            self.report({"WARNING"}, "还没有可重发的消息")
+            return {"CANCELLED"}
+
+        session = _peek_session()
+        if session is not None and session.running:
+            self.report({"WARNING"}, "上一轮还没结束，等一下再重发")
+            return {"CANCELLED"}
+
+        # 清掉上一条的失败痕迹，让新一轮干净开始
+        st.last_error = ""
+        st.last_answer = ""
+        st.input_text = text
+        bpy.ops.blockout.ai_send()
+        return {"FINISHED"}
+
+
 class BO_OT_ai_send(bpy.types.Operator):
     """把输入框内容发给 AI"""
     bl_idname = "blockout.ai_send"
@@ -1088,6 +1355,7 @@ class BO_OT_ai_send(bpy.types.Operator):
             session.title = text[:20] or session.title
 
         session.add_user(text)
+        st.last_user_text = text          # 供「重发」用
         st.input_text = ""
         st.busy = True
         st.last_answer = ""
@@ -1102,9 +1370,24 @@ class BO_OT_ai_send(bpy.types.Operator):
         if p.backend == "dsh":
             # 走 DSH：不需要 key，凭据和模型都在 DSH 那边
             port = int(p.dsh_port)
+            # ★ attach 也要在进线程前读成普通字符串：
+            #   _attach_of 会碰 bpy.context，后台线程不允许。
+            attach = _attach_of(session.sid)
+            # ★ .blend 所在目录同样要在**主线程**算好。
+            #   传空串时 DSH 会退到 profiles/desktop，那边看不到
+            #   你的工程和这个插件，AI 只能瞎猜（说过"9876 端口没人接"）。
+            workdir = ""
+            try:
+                fp = bpy.data.filepath or ""
+                if fp:
+                    d = os.path.dirname(fp)
+                    if d and os.path.isdir(d):
+                        workdir = d
+            except Exception:               # noqa: BLE001
+                workdir = ""
             t = threading.Thread(
                 target=agent.run_turn_via_dsh,
-                args=(session, port, text),
+                args=(session, port, text, attach, workdir),
                 daemon=True)
             session.thread = t
             t.start()
@@ -1204,16 +1487,27 @@ class BO_OT_ai_scroll(bpy.types.Operator):
         return {"FINISHED"}
 
 
-def _export_to_text(session):
-    """把整段对话写成 Blender 文本块，返回文本名。
+def _export_to_text(session, max_rows=None):
+    """把对话写成 Blender 文本块，返回文本名。
 
     独立成普通函数：算子不能直接构造（bpy_struct 限制），
     测试和算子都调它，逻辑只有一份。
+
+    max_rows: 只导出最近这么多条问答。默认 None = 全部。
+      「放大查看」传 30：Blender 只是最近在聊什么的窗口，
+      完整历史去 DSH 网页端看 —— 一次弹几千条没人读得下去。
     """
     rows = _qa_rows(session)
+    total = len(rows)
+    if max_rows is not None and total > max_rows:
+        rows = rows[-max_rows:]
+
     lines = []
     title = session.title if session is not None else "无会话"
-    lines.append("# %s · %d 条对话" % (title, len(rows)))
+    if total > len(rows):
+        lines.append("# %s · 最近 %d 条（共 %d 条）" % (title, len(rows), total))
+    else:
+        lines.append("# %s · %d 条对话" % (title, total))
     lines.append("# 这个窗口可以拖动边缘放大、滚动、选中复制")
     lines.append("")
     for lv, tx in rows:
@@ -1232,25 +1526,106 @@ def _export_to_text(session):
     return name, txt
 
 
-class BO_OT_ai_expand(bpy.types.Operator):
-    """放大查看：把完整对话写进 Blender 文本编辑器
-
-    ⚠ 为什么不用 invoke_popup：实测在 N 侧栏的 panel 里调用，
-      弹窗要么不出现、要么一闪就没（上下文不对）。用户点了没反应。
-      改用文本编辑器：**一定能开、能自由拉伸、能选中复制**，
-      而且不依赖任何弹窗上下文。
-    """
-    bl_idname = "blockout.ai_expand"
-    bl_label = "放大查看"
+class BO_OT_ai_refresh_answer(bpy.types.Operator):
+    """重新取一次本轮完整回答，覆盖显示（不追历史）"""
+    bl_idname = "blockout.ai_refresh_answer"
+    bl_label = "刷新回答"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
         st = context.window_manager.blockout_ai
         session = _peek_session()
+        if session is None:
+            self.report({"WARNING"}, "没有活动会话")
+            return {"CANCELLED"}
 
-        name, txt = _export_to_text(session)
+        # ★ 取"本轮最后一次完整回答"，不是历史里所有 say 行。
+        #   一问一答的模式下，一次只该显示一条答案。
+        text = _latest_answer(session)
+        if not text:
+            self.report({"INFO"}, "本轮还没有完整回答")
+            return {"CANCELLED"}
 
-        # 尽量在某个区域里打开它
+        st.last_answer = text[:16000]
+        st.last_answer_sid = session.sid
+        st.status = "已刷新回答"
+        _tag_redraw()
+        self.report({"INFO"}, "已刷新（%d 字）" % len(text))
+        return {"FINISHED"}
+
+
+class BO_OT_ai_expand(bpy.types.Operator):
+    """放大查看：在弹窗里显示完整对话（不占满屏幕）
+
+    ⚠ 历史坑：早先的实现是把 VIEW_3D 区域直接切成 TEXT_EDITOR，
+      结果用户一点「放大」整个视口就没了 —— 这次改成浮层弹窗，
+      关掉就回到原样。同时也保留导出到文本编辑器的入口
+      （弹窗里点「在文本编辑器中打开」）。
+    """
+    bl_idname = "blockout.ai_expand"
+    bl_label = "放大查看"
+    bl_options = {"REGISTER"}
+
+    #: 弹窗宽度（像素）。Blender 会根据内容再调整高度。
+    width = 760
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=self.width)
+
+    def draw(self, context):
+        st = context.window_manager.blockout_ai
+        session = _peek_session()
+
+        col = self.layout.column()
+        title = session.title if session is not None else "（无会话）"
+        col.label(text="%s · %d 条消息" % (
+            title,
+            session.message_count() if session is not None else 0,
+        ), icon="TEXT")
+
+        # 对话正文：用 label 逐行画。弹窗太高时 Blender 自己出滚动条。
+        box = col.box()
+        all_rows = _qa_rows(session) if session is not None else []
+        if not all_rows:
+            box.label(text="（还没有消息）", icon="INFO")
+        else:
+            # 只显示最近 20 条。Blender 面板只当"最近在聊什么"的窗口，
+            # 一次弹几千条既画不动也没人读 —— 完整历史去 DSH 网页端。
+            rows = all_rows[-20:]
+            if len(all_rows) > len(rows):
+                box.label(
+                    text="（显示最近 %d 条，共 %d 条）" % (len(rows), len(all_rows)),
+                    icon="INFO")
+            for lv, tx in rows:
+                icon = _ICONS.get(lv, "DOT")
+                text = tx.replace("\n", " ")
+                for k in range(0, min(len(text), 720), 68):
+                    box.label(
+                        text=(_PREFIX.get(lv, "") if k == 0 else "   ") + text[k:k + 68],
+                        icon=icon if k == 0 else "BLANK1")
+
+        col.separator()
+        col.operator("blockout.ai_export_text",
+                     text="在文本编辑器中打开（全部历史）", icon="TEXT")
+
+    def execute(self, context):
+        # 弹窗点「确定」= 关掉，不做事
+        return {"FINISHED"}
+
+
+class BO_OT_ai_export_text(bpy.types.Operator):
+    """把完整对话导出到 Blender 文本编辑器"""
+    bl_idname = "blockout.ai_export_text"
+    bl_label = "导出到文本编辑器"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        st = context.window_manager.blockout_ai
+        session = _peek_session()
+        # 限制 200 条：文本编辑器一次塞几千条会卡，而且也没人翻。
+        # 头部会写明「最近 N 条（共 M 条）」。
+        name, txt = _export_to_text(session, max_rows=200)
+
         opened = False
         try:
             for area in context.screen.areas:
@@ -1262,7 +1637,6 @@ class BO_OT_ai_expand(bpy.types.Operator):
             debuglog.write("打开文本编辑器失败: %s" % e)
 
         if not opened:
-            # 没有文本编辑器区域 → 直接把主区域切成文本编辑器
             try:
                 area = context.area
                 if area is not None and area.type == "VIEW_3D":
@@ -1480,43 +1854,80 @@ class VIEW3D_PT_blockout_ai(bpy.types.Panel):
                 ebox.label(text=txt[i:i + 52])
 
     def _draw_transcript(self, layout, st, session):
-        # ── 对话记录：只画问答 ──
-        #   过程信息（STREAM POST / 心跳 / 工具日志）一律不画。
-        #   N 面板本来就窄，那些东西会把真正的回答挤出去。
-        rows = _qa_rows(session)
-        if not rows:
-            return
+        """问题列表 + 一块"最新回答"。
 
-        # ★ 滚动：scroll 是 Blender 属性，用户上下滚就变
-        n = len(rows)
-        view = max(3, st.view_lines)          # 可显示的条数
-        max_top = max(0, n - view)
-        top = max(0, min(st.scroll_top, max_top))
-        if top != st.scroll_top:
-            st.scroll_top = top               # 自动夹住越界值
+        为什么这么拆：
+          DSH 一轮会吐多条 assistant 消息（先一句"我看看"，再补完整答案），
+          把问答混在一起排，用户会看到「问题 → 短句 → 问题 → 长文」这种错位。
+          所以上面对话框**只显示用户问过什么**，回答单独放一块，
+          点一次刷新按钮就换成本轮最新的完整答案，不堆历史。
+        """
+        # ── 上面：只列问题 ──
+        asks = [(lv, tx) for lv, tx in _qa_rows(session) if lv == "user"]
+        if asks:
+            n = len(asks)
+            view = max(2, min(st.view_lines, 8))
+            max_top = max(0, n - view)
+            top = max(0, min(st.scroll_top, max_top))
+            if top != st.scroll_top:
+                st.scroll_top = top
 
-        visible = rows[top:top + view]
+            bar = layout.row(align=True)
+            bar.label(text="问题 %d/%d" % (min(top + view, n), n), icon="QUESTION")
+            op = bar.operator("blockout.ai_scroll", text="", icon="EVENT_UP_ARROW")
+            op.delta = -view
+            op = bar.operator("blockout.ai_scroll", text="", icon="EVENT_DOWN_ARROW")
+            op.delta = view
 
-        # 工具条：滚动 + 放大
-        bar = layout.row(align=True)
-        bar.label(text="%d/%d" % (min(top + view, n), n), icon="TEXT")
-        op = bar.operator("blockout.ai_scroll", text="", icon="EVENT_UP_ARROW")
-        op.delta = -view
-        op = bar.operator("blockout.ai_scroll", text="", icon="EVENT_DOWN_ARROW")
-        op.delta = view
-        bar.operator("blockout.ai_expand", text="放大",
-                     icon="FULLSCREEN_ENTER")
+            col = layout.column()
+            for _lv, tx in asks[top:top + view]:
+                text = tx.replace("\n", " ")
+                for k in range(0, min(len(text), 320), 52):
+                    col.label(
+                        text=(_PREFIX.get("user", "") if k == 0 else "   ") + text[k:k + 52],
+                        icon="USER" if k == 0 else "BLANK1")
 
-        col = layout.column()
-        for lv, tx in visible:
-            icon = _ICONS.get(lv, "DOT")
-            text = tx.replace("\n", " ")
-            prefix = _PREFIX.get(lv, "")
-            for k in range(0, min(len(text), 720), 52):
-                col.label(text=(prefix if k == 0 else "   ") + text[k:k + 52],
-                          icon=icon if k == 0 else "BLANK1")
+        # ── 下面：最新回答（单块） ──
+        ans = (st.last_answer or "").strip()
+        abox = layout.box()
+        head = abox.row(align=True)
+        head.label(text="最新回答" if ans else "最新回答（空）", icon="TEXT")
+        # 刷新 = 从会话里重新取一次本轮完整答案，覆盖显示。不累积历史。
+        head.operator("blockout.ai_refresh_answer", text="", icon="FILE_REFRESH")
+        head.operator("blockout.ai_expand", text="", icon="FULLSCREEN_ENTER")
+        if ans:
+            text = ans.replace("\n", " ")
+            for k in range(0, min(len(text), 1600), 52):
+                abox.label(text=text[k:k + 52])
+        elif st.status:
+            abox.label(text=st.status[:60], icon="DOT")
 
     def _draw_input(self, layout, st):
+        # ── 接哪个 DSH 会话 ──
+        #   默认新建 blender-chat-xxx；也可以挑一条已有会话接着聊。
+        #   绑在 Blender 会话上（st.sessions[i].dsh_session_id），
+        #   切换 Blender 会话时跟着走。
+        bound = _attach_of(st.active_sid)
+        bound_label = _title_of_pick(st, bound) if bound else ""
+
+        sb = layout.box()
+        head = sb.row(align=True)
+        if bound:
+            head.label(text="接: " + (bound_label or bound[:28]), icon="LINKED")
+        else:
+            head.label(text="接: 新建会话", icon="FILEBROWSER")
+        head.operator("blockout.ai_pick_dsh", text="", icon="FILE_REFRESH")
+
+        # 菜单式选择：N 面板窄，下拉框会把标题截断，点菜单能看全
+        pick = sb.row(align=True)
+        pick.operator("blockout.ai_pick_menu", text="选择会话…", icon="COLLAPSEMENU")
+        if bound:
+            pick.operator("blockout.ai_unattach_dsh", text="", icon="UNLINKED")
+
+        if st.dsh_pick_status:
+            sb.label(text=st.dsh_pick_status[:60], icon="INFO")
+        sb.prop(st, "dsh_live_only", text="只列工作区在用的")
+
         # ── 权限：三档，一眼看出现在什么级别 ──
         prow = layout.row(align=True)
         prow.label(text="权限", icon="LOCKED" if st.permission == "ask"
@@ -1533,6 +1944,14 @@ class VIEW3D_PT_blockout_ai(bpy.types.Panel):
         op = row.operator("blockout.ai_cancel", text="中断", icon="CANCEL")
         op.quiet = False
         row.operator("blockout.ai_clear", text="", icon="X")
+
+        # ── 出错后的一键重试 ──
+        #   502 / 超时这类网关错误经常是临时的，重发一次就好，
+        #   不用把原文重新敲一遍。
+        if st.last_error and st.last_user_text:
+            er = layout.row(align=True)
+            er.label(text="上次失败", icon="ERROR")
+            er.operator("blockout.ai_resend", text="重发上一条", icon="FILE_REFRESH")
 
         # ── 快捷 ──
         b = layout.box()
@@ -1575,6 +1994,7 @@ classes = (
     AILine,
     AISessionItem,
     AIAnswerItem,
+    AIDshPickItem,
     BlockoutAIState,
     BO_UL_ai_sessions,
     BO_OT_ai_save_prefs,
@@ -1582,12 +2002,19 @@ classes = (
     BO_OT_ai_test,
     BO_OT_ai_clear,
     BO_OT_ai_send,
+    BO_OT_ai_resend,
     BO_OT_ai_cancel,
     BO_OT_ai_scroll,
     BO_OT_ai_expand,
+    BO_OT_ai_refresh_answer,
+    BO_OT_ai_export_text,
     BO_OT_ai_confirm,
     BO_OT_ai_quick,
     BO_OT_ai_new_session,
+    BO_OT_ai_pick_dsh,
+    BO_OT_ai_pick_menu,
+    BO_OT_ai_attach_dsh,
+    BO_OT_ai_unattach_dsh,
     BO_OT_ai_switch_session,
     BO_OT_ai_delete_session,
     BO_OT_ai_rename_session,
