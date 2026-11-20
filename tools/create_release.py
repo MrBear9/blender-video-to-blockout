@@ -25,7 +25,7 @@ except (AttributeError, OSError):
 
 OWNER = "MrBear9"
 REPO = "blender-video-to-blockout"
-TAG = "v1.12.0"
+TAG = "v1.14.0"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BODY = """## Installation
