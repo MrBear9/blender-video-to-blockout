@@ -13,7 +13,7 @@ bl_info = {
     "name": "Blockout Helper",
     "author": "MrBear9, dafeiyu",
     "maintainer": "MrBear9",
-    "version": (1, 12, 0),
+    "version": (1, 14, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > Blockout",
     "description": "Video to blockout + AI assistant: camera alignment, "
@@ -39,6 +39,7 @@ from mathutils import Vector, Matrix, Quaternion, Euler
 try:
     from . import kit, skeleton, camera as camera_mod, scene as scene_mod
     from . import ops_video
+    from . import video_ref
     _video_ops = ops_video.classes
     _VIDEO_OK = True
     _VIDEO_ERR = ""
@@ -55,6 +56,20 @@ except Exception as _e2:
     ui_ai = None
     _ai_ok = False
     _ai_err = "%s: %s" % (type(_e2).__name__, _e2)
+
+# ── DSH Blender Bridge（第三方，作者 Siddharth Ahuja，原为独立插件）──
+# 合并成一个插件的目的是"只装一次"，但它内部有 69 个文件、自己的面板组
+# （侧边栏 Category 仍是 "DSH Blender Bridge"，和 Blockout 分两个 tab）。
+# 它是操作 Blender 的运行时通道，导入失败**绝不能**连累建模面板 ——
+# 所以这里单独兜住，出问题时插件照常可用，只是桥接不启动。
+try:
+    from . import bridge as bridge_mod
+    _bridge_ok = True
+    _bridge_err = ""
+except Exception as _e3:
+    bridge_mod = None
+    _bridge_ok = False
+    _bridge_err = "%s: %s" % (type(_e3).__name__, _e3)
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +862,55 @@ def mask_aabb(path):
                 pass
 
 
+def _update_ref_overlay(self, context):
+    """视口叠加开关：把原片压成当前相机的背景图。
+
+    为什么用相机背景图而不是 gpu draw handler：
+    背景图是 Blender 原生功能，会跟着相机透视正确贴合，Numpad 0 进相机视角
+    就能直接和白模比对；自绘句柄要自己算投影矩阵，还得处理 DNA 主题、
+    多视口、色彩管理，为这一个开关不值得。
+    """
+    try:
+        apply_ref_overlay(context.scene, self)
+    except Exception as e:                     # noqa: BLE001
+        print("[blockout_helper] 原片叠加失败: %s" % e)
+
+
+def apply_ref_overlay(scene, props):
+    """按 props.ref_overlay 把原片挂到当前相机的背景上（或摘掉）。"""
+    cam = scene.camera
+    if cam is None:
+        return False
+    cam_data = cam.data
+    cam_data.background_images.clear()
+
+    if not props.ref_overlay or not props.ref_path:
+        cam_data.show_background_images = False
+        return False
+
+    path = props.ref_path
+    bg = cam_data.background_images.new()
+    if path.lower().endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+        # 复用已有 clip，别每次点开关都新建一个数据块
+        clip = bpy.data.movieclips.get(os.path.basename(path))
+        if clip is None:
+            clip = bpy.data.movieclips.load(path)
+        bg.source = "MOVIE_CLIP"
+        bg.clip = clip
+    else:
+        img = bpy.data.images.get(os.path.basename(path))
+        if img is None:
+            img = bpy.data.images.load(path)
+        bg.source = "IMAGE"
+        bg.image = img
+
+    bg.alpha = props.ref_overlay_alpha
+    bg.display_depth = "BACK"
+    bg.frame_method = "FIT"
+    cam_data.show_background_images = True
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Properties
 # ---------------------------------------------------------------------------
@@ -903,16 +967,29 @@ class BlockoutProps(bpy.types.PropertyGroup):
     camera_preset: bpy.props.EnumProperty(
         name="运镜",
         items=[
+            ("follow_ref", "跟原片", "Use the camera trajectory from recon.json"),
             ("cinematic", "Cinematic", "Low angle to overhead"),
             ("turntable", "Turntable", "Full orbit"),
             ("dolly_in", "Dolly in", "Wide to half body"),
             ("top_down", "Top down", "Overhead"),
         ],
-        default="cinematic",
+        default="follow_ref",
     )
     camera_wobble: bpy.props.BoolProperty(
         name="手持微抖", default=True)
     camera_summary: bpy.props.StringProperty(default="")
+
+    # ── 原片参考 / 对比播帧 ──
+    ref_path: bpy.props.StringProperty(
+        name="原片", subtype="FILE_PATH", default="")
+    ref_frames: bpy.props.IntProperty(name="原片帧数", default=0)
+    ref_overlay: bpy.props.BoolProperty(
+        name="视口叠加原片", default=False, update=_update_ref_overlay)
+    ref_overlay_alpha: bpy.props.FloatProperty(
+        name="叠加透明度", default=0.45, min=0.0, max=1.0,
+        update=_update_ref_overlay)
+    ref_show_player: bpy.props.BoolProperty(
+        name="显示播放器", default=True)
 
     verify_verdict: bpy.props.StringProperty(default="")
     verify_worst: bpy.props.FloatProperty(default=0.0)
@@ -937,7 +1014,67 @@ class BlockoutProps(bpy.types.PropertyGroup):
 # Panels
 # ---------------------------------------------------------------------------
 
+def _ref_image():
+    """面板播放器用的 Image —— 对应「最近一次取到的帧」。
+
+    ⚠ **这里不能取帧**。面板的 draw() 每秒会被调用好几次，
+    而取一帧要渲染（~20ms）并临时改 scene 的渲染设置和帧号 ——
+    在 draw 里做等于每帧都卡一次，还会干扰正在跑的渲染。
+    取帧统一由 frame_change_post 回调在「帧真的变了」时做一次，
+    这里只负责把那张图交给 UI。
+
+    ⚠ 必须返回真 Image 对象给 template_image，传 None 会让面板画不出来。
+    """
+    fp = bpy.app.driver_namespace.get("_bo_ref_frame", "")
+    if not fp:
+        return None
+
+    img = bpy.data.images.get("_BO_REF_VIEW")
+    if img is None:
+        try:
+            img = bpy.data.images.load(fp, check_existing=False)
+            img.name = "_BO_REF_VIEW"
+        except Exception:
+            return None
+        return img
+
+    # 同一张图换内容：改 filepath 再 reload，比反复新建/删除数据块便宜
+    if bpy.path.abspath(img.filepath) != fp:
+        try:
+            img.filepath = fp
+            img.reload()
+        except Exception:
+            return img
+    return img
+
+
+def _on_frame_change(scene, depsgraph=None):
+    """时间轴变帧 → 取一张原片缩略图。
+
+    只在「载了原片 + 播放器开着」时做，其它时候立刻返回，
+    不打扰正常建模。
+    """
+    try:
+        props = getattr(scene, "blockout", None)
+        if props is None or not props.ref_path or not props.ref_show_player:
+            return
+        from . import video_ref
+
+        fp = video_ref.grab(scene, props.ref_path, scene.frame_current)
+        if fp:
+            bpy.app.driver_namespace["_bo_ref_frame"] = fp
+    except Exception as e:                     # noqa: BLE001
+        # 帧正在被拖、文件被删、渲染冲突…… 都不该打断用户操作
+        print("[blockout_helper] 原片取帧失败: %s" % e)
+
+
 class VIEW3D_PT_blockout_main(bpy.types.Panel):
+    """视频转白膜 —— 一条流程走完：原片 → 静态搭建 → 动态骨骼 → 验收
+
+    以前拆成「视频转白膜」和「视频转白膜 · 骨骼」两个面板，看着像两条路，
+    实际是同一条：先静态搭好，再让骨骼动起来。合并成一个，按步骤编号走。
+    """
+
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Blockout"
@@ -946,24 +1083,61 @@ class VIEW3D_PT_blockout_main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.blockout
+        scene = context.scene
 
+        # ── 原片：整条流程的参照物，放最上面 ──
         box = layout.box()
-        box.label(text="① 导入", icon="IMPORT")
-        box.operator("blockout.import_recon", text="导入 recon.json")
+        box.label(text="① 原片", icon="FILE_MOVIE")
         row = box.row(align=True)
-        row.operator("blockout.load_ref", text="载入原片")
-        row.prop(props, "bg_alpha", text="")
+        row.operator("blockout.load_ref_video", text="载入原片", icon="FILEBROWSER")
+        if props.ref_frames:
+            box.label(text="%d 帧 · 时间轴 1–%d"
+                      % (props.ref_frames, scene.frame_end), icon="INFO")
 
+        # 播放器：拖时间轴就能看到对应帧，用来比对白模
+        if props.ref_path:
+            box.prop(props, "ref_show_player", text="显示播放器")
+            if props.ref_show_player:
+                img = _ref_image()
+                if img is not None:
+                    # ⚠ template_image(img, "pixels") 实测画不出东西 ——
+                    #   它要求 Image 上有名为 "pixels" 的**属性**，实际取不到。
+                    #   走 preview（icon_id）这条路才真的渲染出来。
+                    try:
+                        img.preview_ensure()
+                        if img.preview and img.preview.icon_id:
+                            box.template_icon(icon_value=img.preview.icon_id,
+                                              scale=9.0)
+                        else:
+                            box.label(text="缩略图未就绪", icon="IMAGE_DATA")
+                    except Exception as e:      # noqa: BLE001
+                        box.label(text="缩略图失败: %s" % e, icon="ERROR")
+                else:
+                    box.label(text="还没取到帧", icon="INFO")
+                box.label(text="第 %d 帧 / 共 %d"
+                          % (scene.frame_current, props.ref_frames),
+                          icon="TIME")
+                row = box.row(align=True)
+                row.operator("blockout.compare_frame", text="并排对照",
+                             icon="IMAGE_REFERENCE")
+            row = box.row()
+            row.prop(props, "ref_overlay", text="视口叠加原片")
+            if props.ref_overlay:
+                row.prop(props, "ref_overlay_alpha", text="")
+
+        # ── 静态搭建 ──
         box = layout.box()
-        box.label(text="② 对着原片摆", icon="MESH_CUBE")
+        box.label(text="② 静态搭建", icon="MESH_CUBE")
+        box.operator("blockout.import_recon", text="导入 recon.json",
+                     icon="IMPORT")
+        box.label(text="重建相机轨迹 + 点云，白模对齐的基准", icon="INFO")
+
         row = box.row(align=True)
         row.prop(props, "box_mode", expand=True)
-
         col = box.column(align=True)
         col.operator("blockout.draw_box", text="拖一个框 → 生成盒子",
                      icon="SELECT_SET")
         box.label(text="拖的时候按住左键，松手就成", icon="INFO")
-        box.separator()
 
         col = box.column(align=True)
         col.operator("blockout.snap_ground", text="落到地面")
@@ -976,95 +1150,76 @@ class VIEW3D_PT_blockout_main(bpy.types.Panel):
         sub.prop(props, "default_thickness")
         sub.prop(props, "ground_depth_ratio")
 
+        # ── 动态：骨骼 ──
         box = layout.box()
-        box.label(text="③ 验收", icon="CHECKMARK")
-        box.operator("blockout.snapshot", text="存一张对照图")
-        box.prop(props, "mask_dir")
-        box.prop(props, "threshold")
-        box.operator("blockout.score", text="算对齐分数")
+        box.label(text="③ 动态骨骼", icon="ARMATURE_DATA")
+        box.operator("blockout.import_joints", text="导入 kp3d.json",
+                     icon="IMPORT")
+        if props.joint_summary:
+            box.label(text=props.joint_summary, icon="INFO")
 
-        if props.last_report:
-            for line in props.last_report.split("\n")[:8]:
-                f = line.split("\t")
-                if len(f) == 4:
-                    try:
-                        box.label(text="%s  %.2f" % (f[0][:14], float(f[1])))
-                    except ValueError:
-                        pass
-
-
-class VIEW3D_PT_blockout_rig(bpy.types.Panel):
-    """Video pipeline: 3D joints -> rig -> camera -> render"""
-
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Blockout"
-    bl_label = "视频转白膜 · 骨骼"
-    bl_options = {"DEFAULT_CLOSED"}
-
-    def draw(self, context):
-        layout = self.layout
-        p = context.scene.blockout
-
-        box = layout.box()
-        box.label(text="① 3D 关节", icon="IMPORT")
-        box.operator("blockout.import_joints", text="导入 kp3d.json")
-        if p.joint_summary:
-            box.label(text=p.joint_summary, icon="INFO")
-        if p.joint_frames:
-            box.label(text="unit %s" % p.joint_unit)
-
-        box = layout.box()
-        box.label(text="② 骨骼白模", icon="ARMATURE_DATA")
         col = box.column(align=True)
-        col.prop(p, "rig_height_m")
-        col.prop(p, "playback_fps")
+        col.prop(props, "rig_height_m")
+        col.prop(props, "playback_fps")
         row = col.row(align=True)
-        row.prop(p, "smooth_median")
-        row.prop(p, "smooth_mean")
+        row.prop(props, "smooth_median")
+        row.prop(props, "smooth_mean")
         row = box.row(align=True)
-        row.prop(p, "rig_with_head")
-        row.prop(p, "rig_with_joints")
-        box.prop(p, "joint_radius_m")
+        row.prop(props, "rig_with_head")
+        row.prop(props, "rig_with_joints")
+        box.prop(props, "joint_radius_m")
         box.operator("blockout.build_rig", text="生成骨骼",
                      icon="OUTLINER_OB_ARMATURE")
-        if p.rig_summary:
-            box.label(text=p.rig_summary, icon="CHECKMARK")
+        if props.rig_summary:
+            box.label(text=props.rig_summary, icon="CHECKMARK")
 
-        box = layout.box()
-        box.label(text="③ 运镜", icon="CAMERA_DATA")
-        box.prop(p, "camera_preset", text="")
-        box.prop(p, "camera_wobble")
-        box.operator("blockout.setup_camera", text="配运镜 + 环境",
-                     icon="PLAY")
-        if p.camera_summary:
-            box.label(text=p.camera_summary, icon="INFO")
+        col = box.column(align=True)
+        col.prop(props, "camera_preset", text="")
+        if props.camera_preset != "follow_ref":
+            col.prop(props, "camera_wobble")
+        col.operator("blockout.setup_camera", text="配运镜 + 环境",
+                     icon="CAMERA_DATA")
+        if props.camera_summary:
+            box.label(text=props.camera_summary, icon="INFO")
 
+        # ── 验收与输出 ──
         box = layout.box()
         box.label(text="④ 验收", icon="CHECKMARK")
         row = box.row(align=True)
         row.operator("blockout.verify_framing", text="检查取景")
-        if p.verify_summary:
-            icon = "CHECKMARK" if p.verify_verdict == "pass" else "ERROR"
-            box.label(text=p.verify_summary, icon=icon)
-            box.label(text="worst NDC ≤ 1.0 才不切边")
+        row.operator("blockout.snapshot", text="存对照图")
+        if props.verify_summary:
+            icon = "CHECKMARK" if props.verify_verdict == "pass" else "ERROR"
+            box.label(text=props.verify_summary, icon=icon)
 
         box = layout.box()
         box.label(text="⑤ 出片", icon="RENDER_ANIMATION")
-        box.prop(p, "output_dir")
+        box.prop(props, "output_dir")
         row = box.row(align=True)
-        row.prop(p, "render_w")
-        row.prop(p, "render_h")
+        row.prop(props, "render_w")
+        row.prop(props, "render_h")
         row = box.row(align=True)
-        row.prop(p, "output_fps")
-        row.prop(p, "encode_quality")
-        box.prop(p, "render_force")
+        row.prop(props, "output_fps")
+        row.prop(props, "encode_quality")
+        box.prop(props, "render_force")
         box.operator("blockout.render_video", text="渲染并编码 MP4",
                      icon="RENDER_ANIMATION")
-        if p.render_summary:
-            box.label(text=p.render_summary, icon="INFO")
+        if props.render_summary:
+            box.label(text=props.render_summary, icon="INFO")
         box.operator("blockout.export_rig_glb", text="导出 GLB",
                      icon="EXPORT")
+
+        # ── 收尾：对齐打分是老流程，留个入口，别把功能删了 ──
+        sub = layout.column(align=True)
+        sub.operator("blockout.score", text="算对齐分数")
+        if props.last_report:
+            for line in props.last_report.split("\n")[:6]:
+                f = line.split("\t")
+                if len(f) == 4:
+                    try:
+                        sub.label(text="%s  %.2f" % (f[0][:14], float(f[1])))
+                    except ValueError:
+                        pass
 
 
 class VIEW3D_PT_blockout_view(bpy.types.Panel):
@@ -1098,7 +1253,6 @@ classes = (
     BO_OT_snapshot,
     BO_OT_score,
     VIEW3D_PT_blockout_main,
-    VIEW3D_PT_blockout_rig,
     VIEW3D_PT_blockout_view,
 )
 
@@ -1123,6 +1277,19 @@ def register():
     for c in reversed(classes):
         _unreg_quietly(c)
 
+    # ── 桥接的偏好属性必须在 BlockoutAIPrefs 注册**之前**注入 ──
+    #   Blender 只在 register_class 那一刻收集注解里的 bpy.props，
+    #   注册完再 setattr 是不生效的（面板上那几行会画不出来）。
+    if _bridge_ok and bridge_mod is not None:
+        try:
+            from .bridge.ui.preferences import inject_into
+            if _ai_ok and ui_ai is not None:
+                n = inject_into(ui_ai.BlockoutAIPrefs)
+                if n:
+                    print("[blockout_helper] 桥接偏好属性已并入 AddonPreferences: %d 个" % n)
+        except Exception as e:                  # noqa: BLE001
+            print("[blockout_helper] 桥接偏好注入失败: %s" % e)
+
     for c in classes:
         try:
             bpy.utils.register_class(c)
@@ -1134,6 +1301,10 @@ def register():
         except (RuntimeError, ValueError) as e:
             print("[blockout_helper] 注册 %s 失败: %s" % (c.__name__, e))
 
+    # 时间轴变帧 → 刷新原片缩略图（面板播放器用）
+    if _on_frame_change not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_on_frame_change)
+
     if _ai_ok and ui_ai is not None:
         try:
             ui_ai.register()
@@ -1143,8 +1314,30 @@ def register():
     if not hasattr(bpy.types.Scene, "blockout"):
         bpy.types.Scene.blockout = bpy.props.PointerProperty(type=BlockoutProps)
 
+    # ── 桥接本体（面板 / 算子 / socket 服务）──
+    #   放最后：它注册失败不该影响上面的建模功能。
+    if _bridge_ok and bridge_mod is not None:
+        try:
+            bridge_mod.register()
+            print("[blockout_helper] DSH Blender Bridge 已随插件启动")
+        except Exception as e:                  # noqa: BLE001
+            print("[blockout_helper] 桥接注册失败: %s" % e)
+
 
 def unregister():
+    # 先停桥接：它持有 socket 线程，晚停会留下占着 9876 端口的孤儿
+    if _bridge_ok and bridge_mod is not None:
+        try:
+            bridge_mod.unregister()
+        except Exception as e:                  # noqa: BLE001
+            print("[blockout_helper] 桥接注销失败: %s" % e)
+
+    try:
+        while _on_frame_change in bpy.app.handlers.frame_change_post:
+            bpy.app.handlers.frame_change_post.remove(_on_frame_change)
+    except Exception:
+        pass
+
     if _ai_ok and ui_ai is not None:
         try:
             ui_ai.unregister()

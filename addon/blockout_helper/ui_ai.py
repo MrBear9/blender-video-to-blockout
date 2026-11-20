@@ -153,6 +153,17 @@ class BlockoutAIPrefs(bpy.types.AddonPreferences):
         box.operator("blockout.ai_clear", text="清空当前会话消息",
                      icon="X")
 
+        # ── 桥接设置（原 DSH Blender Bridge 的偏好面板）──
+        # 属性已由 __init__.register() 注入到本类，直接画就行；
+        # 拿不到就说明桥接没导入成功，别让整个设置页崩掉。
+        try:
+            from .bridge.ui.preferences import draw_bridge_section
+            draw_bridge_section(col, self)
+        except Exception as e:                  # noqa: BLE001
+            box = col.box()
+            box.label(text="DSH Blender Bridge：未加载", icon="ERROR")
+            box.label(text=str(e)[:60])
+
 
 class BO_OT_ai_save_prefs(bpy.types.Operator):
     """把当前偏好设置（含 API Key）存盘，下次启动还在"""

@@ -149,7 +149,7 @@ class BO_OT_build_rig(bpy.types.Operator):
 
 
 class BO_OT_setup_camera(bpy.types.Operator):
-    """③ 给骨骼配运镜（环绕/推近/俯拍/转台）"""
+    """③ 配运镜：跟原片（用 recon.json 的轨迹）或自动运镜"""
 
     bl_idname = "blockout.setup_camera"
     bl_label = "③ 配运镜"
@@ -168,6 +168,44 @@ class BO_OT_setup_camera(bpy.types.Operator):
                     if o is not None and o.name in bpy.data.objects]
             if not live:
                 raise RuntimeError("骨骼对象已不在场景里")
+
+            # ── 跟原片：直接复用 recon.json 的相机轨迹 ──
+            #
+            #   以前这里**无条件**新建 BO_Cam 并设成 scene.camera，
+            #   把 import_reconstruction() 建好的 CameraTrajectory 顶掉。
+            #   结果就是白模永远从"另一个自选机位"看，和导入的视频对不上。
+            #   要和白模逐帧比对，必须用原片自己的运镜。
+            traj = bpy.data.objects.get("CameraTrajectory")
+            if props.camera_preset == "follow_ref" and traj is not None:
+                scene.camera = traj
+                # 原片相机可能没有目标空物体；对焦用骨骼中心
+                c = kit.objects_bbox_center(live)
+                info = {
+                    "camera": traj, "target": None, "preset": "follow_ref",
+                    "frames": int(scene.frame_end - scene.frame_start + 1),
+                    "scene_center": [round(c.x, 3), round(c.y, 3), round(c.z, 3)],
+                    "hmax": round(max(
+                        (o.matrix_world @ Vector(v)).z
+                        for o in live for v in o.bound_box), 3),
+                }
+                # 轨迹相机已经带关键帧，不要再写一遍
+                scene_mod.setup_world(
+                    scene, center=(c.x, c.y),
+                    floor_size=max(6.0, info["hmax"] * 4.0))
+                scene_mod.setup_workbench(
+                    scene, res=(props.render_w, props.render_h))
+                props.camera_summary = "跟原片 · %d 帧" % info["frames"]
+                self.report({"INFO"}, props.camera_summary)
+                return {"FINISHED"}
+
+            if props.camera_preset == "follow_ref":
+                # 选了跟原片但没导过 recon.json —— 说清缺什么，别默默换别的机位
+                self.report(
+                    {"ERROR"},
+                    "没有原片相机轨迹：先在第 ① 步导入 recon.json，"
+                    "或者把运镜改成 Cinematic 等预设")
+                return {"CANCELLED"}
+
             info = cam_mod.setup_camera(
                 scene, live,
                 preset=props.camera_preset,
@@ -304,6 +342,187 @@ class BO_OT_export_glb(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+class BO_OT_load_ref_video(bpy.types.Operator):
+    """① 载入原片：挂进 VSE 取帧，并压成相机背景对着看"""
+
+    bl_idname = "blockout.load_ref_video"
+    bl_label = "载入原片"
+    bl_options = {"REGISTER"}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(
+        default="*.mp4;*.mov;*.avi;*.mkv;*.webm;*.jpg;*.jpeg;*.png",
+        options={"HIDDEN"},
+    )
+
+    def execute(self, context):
+        props = context.scene.blockout
+        scene = context.scene
+        path = self.filepath
+        if not path:
+            self.report({"ERROR"}, "没选文件")
+            return {"CANCELLED"}
+
+        try:
+            from . import video_ref
+
+            is_video = path.lower().endswith(
+                (".mp4", ".mov", ".avi", ".mkv", ".webm"))
+            if is_video:
+                info = video_ref.ensure_strip(scene, path)
+                props.ref_frames = info["frames"]
+                # 原片帧数决定时间轴长度。骨骼如果已经建好，取两者大的那个，
+                # 免得载入原片把已经做好的动画切短。
+                scene.frame_start = 1
+                scene.frame_end = max(scene.frame_end, info["frames"])
+            else:
+                props.ref_frames = 1
+
+            props.ref_path = path
+            # 存进 driver_namespace 给面板播放器读，避免每帧查磁盘
+            bpy.app.driver_namespace["_bo_ref_path"] = path
+
+            # 立刻抓一帧：不然面板播放器要等用户动时间轴才出图
+            bpy.app.driver_namespace.pop("_bo_ref_frame", None)
+            fp = video_ref.grab(scene, path, scene.frame_current)
+            if fp:
+                bpy.app.driver_namespace["_bo_ref_frame"] = fp
+        except Exception as e:
+            return _err(self, e)
+
+        self.report({"INFO"}, "原片已载入（%d 帧）" % props.ref_frames)
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
+class BO_OT_grab_ref_frame(bpy.types.Operator):
+    """取当前帧的原片画面（面板播放器刷新用）"""
+
+    bl_idname = "blockout.grab_ref_frame"
+    bl_label = "刷新原片帧"
+    bl_options = {"REGISTER"}
+
+    force: bpy.props.BoolProperty(default=False)
+
+    def execute(self, context):
+        props = context.scene.blockout
+        if not props.ref_path:
+            self.report({"ERROR"}, "先载入原片")
+            return {"CANCELLED"}
+        try:
+            from . import video_ref
+
+            fp = video_ref.grab(
+                context.scene, props.ref_path,
+                context.scene.frame_current, force=self.force)
+            if not fp:
+                self.report({"ERROR"}, "取帧失败")
+                return {"CANCELLED"}
+            bpy.app.driver_namespace["_bo_ref_frame"] = fp
+            # 让面板立刻重绘：不重绘的话点了按钮图还是旧的
+            for a in context.screen.areas:
+                if a.type in ("VIEW_3D", "PROPERTIES"):
+                    a.tag_redraw()
+        except Exception as e:
+            return _err(self, e)
+        return {"FINISHED"}
+
+
+class BO_OT_compare_frame(bpy.types.Operator):
+    """把「原片帧 / 白模帧」并排渲成一张对照图"""
+
+    bl_idname = "blockout.compare_frame"
+    bl_label = "并排对照"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        props = context.scene.blockout
+        scene = context.scene
+        if not props.ref_path:
+            self.report({"ERROR"}, "先载入原片")
+            return {"CANCELLED"}
+
+        outdir = bpy.path.abspath(props.output_dir or "//blockout_out")
+        try:
+            from . import video_ref
+
+            os.makedirs(outdir, exist_ok=True)
+            f = scene.frame_current
+
+            ref_png = video_ref.grab(scene, props.ref_path, f,
+                                     size=(640, 360), force=True)
+            if not ref_png:
+                raise RuntimeError("取原片帧失败")
+
+            # 白模当前帧
+            keep_fmt = scene.render.image_settings.file_format
+            keep_rx, keep_ry = scene.render.resolution_x, scene.render.resolution_y
+            keep_seq = scene.render.use_sequencer
+            keep_path = scene.render.filepath
+            mine = os.path.join(outdir, "compare_%05d.png" % f)
+            try:
+                scene.render.use_sequencer = False
+                scene.render.resolution_x, scene.render.resolution_y = 640, 360
+                scene.render.image_settings.file_format = "PNG"
+                scene.render.filepath = mine
+                bpy.ops.render.render(write_still=True)
+            finally:
+                scene.render.image_settings.file_format = keep_fmt
+                scene.render.resolution_x, scene.render.resolution_y = keep_rx, keep_ry
+                scene.render.use_sequencer = keep_seq
+                scene.render.filepath = keep_path
+
+            side = _side_by_side(ref_png, mine, os.path.join(
+                outdir, "compare_side_%05d.png" % f))
+        except Exception as e:
+            return _err(self, e)
+
+        bpy.app.driver_namespace["_bo_compare"] = side
+        self.report({"INFO"}, "对照图: %s" % side)
+        return {"FINISHED"}
+
+
+def _side_by_side(left_png, right_png, out_png):
+    """把两张 PNG 左右拼起来。
+
+    用 numpy 直接读像素 —— 不走 Blender 的合成节点，
+    因为切场景节点会把用户正在用的节点树改掉。
+    """
+    import numpy as np
+
+    def load(p):
+        img = bpy.data.images.load(p, check_existing=False)
+        try:
+            w, h = img.size
+            a = np.empty(w * h * 4, dtype=np.float32)
+            img.pixels.foreach_get(a)
+            return a.reshape(h, w, 4), w, h
+        finally:
+            bpy.data.images.remove(img)
+
+    la, lw, lh = load(left_png)
+    ra, rw, rh = load(right_png)
+    # 高度对齐到较小者，宽度各自缩放由调用方保证（都传 640x360）
+    h = min(lh, rh)
+    la = la[:h, :, :]
+    ra = ra[:h, :, :]
+    out = np.concatenate([la, ra], axis=1)
+
+    oh, ow = out.shape[0], out.shape[1]
+    img = bpy.data.images.new("_bo_side", width=ow, height=oh, alpha=True)
+    try:
+        img.pixels.foreach_set(out.reshape(-1))
+        img.filepath_raw = out_png
+        img.file_format = "PNG"
+        img.save()
+    finally:
+        bpy.data.images.remove(img)
+    return out_png
+
+
 classes = (
     BO_OT_import_joints,
     BO_OT_build_rig,
@@ -311,4 +530,7 @@ classes = (
     BO_OT_verify,
     BO_OT_render_video,
     BO_OT_export_glb,
+    BO_OT_load_ref_video,
+    BO_OT_grab_ref_frame,
+    BO_OT_compare_frame,
 )
