@@ -121,3 +121,21 @@ addon/blockout_helper/build_info.json
 *.patch.diff
 _cleanup_manifest*.txt
 *.broken
+
+# 插件合并前的手工备份（一次性回退点，验证完就该删）
+_backup_*/
+
+# ══════════════════════════════════════════════════════════════
+# 内置的第三方桥接：不入库
+# ══════════════════════════════════════════════════════════════
+# DSH Blender Bridge（sixtysevenlf/dsh-blender-plugin）的 Blender 插件包
+# 用的是 **GPL-3.0-or-later**，而本仓库是 MIT —— GPL 有传染性，把这份代码
+# 提交进仓库会让整个 blockout_helper 的分发受 GPL 约束，两者不兼容。
+#
+# 所以：本地保留（装到一个插件里，界面照常两个 tab），但**不进版本控制**。
+# 对外发布时用的是不含 bridge 的纯 MIT 版本，用户另装上游 zip。
+#
+# 需要这份代码的话：
+#   python tools/fetch_bridge.py     # 从上游拉取
+# 或者手工装上游的 dsh_blender_bridge.zip。
+addon/blockout_helper/bridge/

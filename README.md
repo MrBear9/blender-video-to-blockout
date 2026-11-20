@@ -17,12 +17,38 @@ Video-to-blockout toolchain for Blender, with an AI assistant panel and a DSH br
 
 ```
 addon/blockout_helper/      Blender 插件（可安装的 zip 源码）
+  bridge/                   (不入库) 第三方 agent 通道，按需拉取
 dsh-plugin/                 DSH 插件：让 Blender 面板借用 DSH 的模型
-tests/                      回归测试（30 套）
+tests/                      回归测试（33 套）
 tools/                      构建与运维脚本
 docs/                       设计与实验记录
 data/                       产物与素材（不入库）
 ```
+
+> **关于 `addon/blockout_helper/bridge/`（默认不在仓库里）**
+>
+> 这是第三方插件 **DSH Blender Bridge** 的来源目录，让 DSH 的 agent 能直接
+> 操作 Blender（本地 TCP，默认 9876）。
+>
+> 它**不进版本控制**，原因只有一个：上游那个 Blender 插件包是
+> **GPL-3.0-or-later**，而本仓库是 MIT。GPL 有传染性，内置会让整个插件的
+> 分发受 GPL 约束，两者不兼容。所以仓库保持纯 MIT，第三方代码按需拉取。
+>
+> 想在一个插件里同时拿到建模面板和 agent 通道（侧边栏两个 tab）：
+>
+> ```powershell
+> python tools/fetch_bridge.py          # 从上游拉取（默认钉 v3.0.6）
+> python tools/build_zip.py --with-bridge
+> ```
+>
+> 产物是 `data/blockout_helper_with_bridge.zip`。**只供本地自用**，别分发 ——
+> 里面含 GPL 代码。
+>
+> 拉取脚本会做导入自检：上游某些版本是半成品（类被删了但还在被 import），
+> 那种版本拉下来桥接会静默不加载。自检不通过会直接报错并建议换 tag。
+>
+> 也可以完全不装：`python tools/build_zip.py` 出的是纯 MIT 版本，
+> 建模功能完整，只是没有 agent 通道。详见 [NOTICE.md](NOTICE.md#第三方插件vendored)。
 
 ### 快速开始
 
@@ -78,7 +104,7 @@ node probe.mjs        # 端到端自检
   -b --factory-startup --python tests/test_addon.py
 ```
 
-30 套全部通过。需要真实 API Key 的两套在无 Key 时自行跳过。
+33 套全部通过。需要真实 API Key 的两套在无 Key 时自行跳过。
 
 ### 注意
 
@@ -103,12 +129,43 @@ reused without re-entering a key.
 
 ```
 addon/blockout_helper/      Blender addon (installable zip source)
+  bridge/                   (not tracked) third-party agent channel, fetch on demand
 dsh-plugin/                 DSH plugin: lets the Blender panel borrow DSH's model
-tests/                      Regression tests (30 suites)
+tests/                      Regression tests (33 suites)
 tools/                      Build and maintenance scripts
 docs/                       Design notes and experiment logs
 data/                       Outputs and assets (not tracked)
 ```
+
+> **About `addon/blockout_helper/bridge/` (absent by default)**
+>
+> This directory holds the third-party addon **DSH Blender Bridge**, which lets
+> DSH agents drive Blender over a local TCP socket (port 9876 by default).
+>
+> It is **not version-controlled**, for one reason: the upstream Blender
+> package is **GPL-3.0-or-later** while this repository is MIT. GPL is viral,
+> so vendoring it would put the whole addon's distribution under GPL, which is
+> incompatible. The repo stays pure MIT and the third-party code is fetched
+> on demand.
+>
+> To get the modeling panel and the agent channel in one addon (two sidebar
+> tabs):
+>
+> ```powershell
+> python tools/fetch_bridge.py          # pull from upstream (pinned to v3.0.6)
+> python tools/build_zip.py --with-bridge
+> ```
+>
+> The result is `data/blockout_helper_with_bridge.zip`. **For local use only** -
+> it contains GPL code, so don't redistribute it.
+>
+> The fetch script runs an import self-check: some upstream revisions are
+> half-finished (a class is gone but still imported), and that silently
+> disables the bridge. A failed check aborts with a suggested tag to use.
+>
+> You can also skip it entirely: plain `python tools/build_zip.py` builds the
+> MIT-only addon with the full modeling feature set, just without the agent
+> channel. See [NOTICE.md](NOTICE.md#第三方插件vendored).
 
 ### Quick start
 
@@ -167,7 +224,7 @@ the whole directory is excluded from version control. Grab the renders from the
   -b --factory-startup --python tests/test_addon.py
 ```
 
-All 30 suites pass. The two that need a real API key skip themselves when none
+All 33 suites pass. The two that need a real API key skip themselves when none
 is configured.
 
 ### Notes
