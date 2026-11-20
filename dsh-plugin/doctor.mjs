@@ -140,9 +140,15 @@ if (mod?.apply) {
   };
   try {
     mod.apply(ctx, {});
-    item('apply 跑通', routes.length === 4,
+    // 只校验 "路由注册了且都挂在 /blender-chat 前缀下"，
+    // 不写死条数 —— 每加一条路由就得改一次 doctor，太脆。
+    const bad = routes.filter((p) => !String(p).startsWith('/blender-chat'));
+    const ok = routes.length > 0 && bad.length === 0;
+    item('apply 跑通', ok,
       `注册了 ${routes.length} 条: ${routes.join(', ')}`,
-      routes.length === 4 ? null : '路由数不对，检查 src/index.js');
+      ok ? null
+        : routes.length === 0 ? '一条路由都没注册'
+          : `路由没挂在 /blender-chat 前缀下: ${bad.join(', ')}`);
   } catch (e) {
     item('apply 跑通', false, `${e.constructor.name}: ${e.message}`,
       '看上面的 [error] 输出');

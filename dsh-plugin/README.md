@@ -107,17 +107,53 @@ node install.mjs --uninstall
 
 - 插件类型：Cordis 插件，`inject = ['agents']`
 - 用 `ctx.agents.create()` 建会话、`agent.followup(msg)` 投稿
-- 监听 `agent/assistant-stream`（增量）和 `agent/assistant/message`（完整）
-- 通过 `ctx.webServer.register()` 挂 4 条路由
+- **建会话必须带 `agentOptions: { provider, model }`**：不带的话 DSH 建出来的
+  agent 没有模型路由，第一次 followup 就报
+  `has no provider/model`，会话能建但一个字都不回。
+  取值顺序：插件 config 的 `provider`/`model` → 宿主 `agentDefaultModel` → 兜底。
+- 监听 `session/event`（`assistant/message` 收完整文本、`turn/end` 收本轮结束）
+  和 `agent/assistant-stream`（增量，必须带 `{ global: true }`）
+- 通过 `ctx.webServer.register()` 挂 6 条路由
 - Blender 侧轮询取事件，不依赖 WebSocket
+
+### HTTP 接口
+
+| 方法与路径 | 作用 |
+|---|---|
+| `POST /blender-chat/send` | 发一句话。body: `{ sid, text, cwd?, attach? }` |
+| `GET /blender-chat/poll?sid=&since=` | 取事件（`stream` / `final` / `end`） |
+| `GET /blender-chat/sessions?limit=` | 列出宿主上已有会话，供面板下拉选择 |
+| `GET /blender-chat/status` | 当前绑定的会话与运行状态 |
+| `GET /blender-chat/debug` | 最近事件日志（排查用） |
+| `GET /blender-chat/reset?sid=` | 释放会话 |
+
+### 接上已有会话（attach）
+
+默认每次新开一个 `blender-chat-xxx` 会话。想和网页端共用同一条会话，
+在 `send` 的 body 里加 `attach`：
+
+```json
+{ "sid": "panel", "text": "继续刚才那个图", "attach": "session-abc5f7a8" }
+```
+
+`attach` 可以是完整 sessionId，也可以是**唯一前缀**。绑上之后该 `sid`
+一直复用这条会话，历史接着往下写。从 `/blender-chat/sessions` 拿候选列表：
+
+```powershell
+curl "http://127.0.0.1:59645/blender-chat/sessions?limit=20"
+```
+
+返回 `{ ok, count, canList, sessions: [{ sessionId, cwd, createdAt }] }`。
+`canList` 为 `false` 时说明列表取不到，改用完整 id 手动 attach。
 
 **为什么用轮询不用推送**：Blender 的 `bpy` 只能主线程碰，WebSocket 回调线程不安全。
 轮询放在后台线程，事件经 `bpy.app.timers` 回主线程 —— 和现有架构一致。
 
 ## 已知限制
 
-- **事件名可能要调**：`agent/assistant/message` 是参照 qqbot 插件的用法写的，
-  如果实际 DSH 版本用别的名字（比如 `assistant/message`），改 `src/index.js` 里那两行 `ctx.on(...)`。
-  `probe.mjs` 收到 send 但拿不到回复，就是这个原因。
 - 工具调用由 DSH 侧决定，Blender 面板看不到中间过程（只有最终文本）。
 - 一轮一个 session，不做并发合并。
+- 不同 DSH 版本的会话列举方法不一致：插件依次尝试
+  `sessionPersistence.list/listSessions/listHeaders`，都没有就直接扫
+  `~/.dsh/sessions/` 目录（目录名里编码了 cwd）。两条路都不通时
+  `/sessions` 返回空列表，只能手动填完整 id attach。
