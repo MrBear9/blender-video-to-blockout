@@ -1,6 +1,6 @@
 {
   "name": "blender-video-to-blockout",
-  "version": "1.10.3",
+  "version": "1.12.0",
   "description": "Video-to-blockout toolchain for Blender, with an AI assistant panel and a DSH bridge plugin.",
   "license": "MIT",
   "author": "MrBear9",

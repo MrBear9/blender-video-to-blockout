@@ -25,7 +25,7 @@ except (AttributeError, OSError):
 
 OWNER = "MrBear9"
 REPO = "blender-video-to-blockout"
-TAG = "v1.10.3"
+TAG = "v1.12.0"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BODY = """## Installation
@@ -188,7 +188,7 @@ def main():
     else:
         payload = {
             "tag_name": TAG,
-            "name": "v1.10.3 — Blender blockout addon + DSH bridge plugin",
+            "name": "%s — Blender blockout addon + DSH bridge plugin" % TAG,
             "body": BODY,
             "draft": False,
             "prerelease": False,
